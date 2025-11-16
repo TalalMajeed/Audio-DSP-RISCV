@@ -76,6 +76,7 @@ module picorv32 #(
 	parameter [ 0:0] ENABLE_MUL = 0,
 	parameter [ 0:0] ENABLE_FAST_MUL = 0,
 	parameter [ 0:0] ENABLE_DIV = 0,
+	parameter [ 0:0] ENABLE_AUDIO = 0,
 	parameter [ 0:0] ENABLE_IRQ = 0,
 	parameter [ 0:0] ENABLE_IRQ_QREGS = 1,
 	parameter [ 0:0] ENABLE_IRQ_TIMER = 1,
@@ -166,7 +167,7 @@ module picorv32 #(
 	localparam integer regfile_size = (ENABLE_REGS_16_31 ? 32 : 16) + 4*ENABLE_IRQ*ENABLE_IRQ_QREGS;
 	localparam integer regindex_bits = (ENABLE_REGS_16_31 ? 5 : 4) + ENABLE_IRQ*ENABLE_IRQ_QREGS;
 
-	localparam WITH_PCPI = ENABLE_PCPI || ENABLE_MUL || ENABLE_FAST_MUL || ENABLE_DIV;
+	localparam WITH_PCPI = ENABLE_PCPI || ENABLE_MUL || ENABLE_FAST_MUL || ENABLE_DIV || ENABLE_AUDIO;
 
 	localparam [35:0] TRACE_BRANCH = {4'b 0001, 32'b 0};
 	localparam [35:0] TRACE_ADDR   = {4'b 0010, 32'b 0};
@@ -264,6 +265,11 @@ module picorv32 #(
 	wire        pcpi_div_wait;
 	wire        pcpi_div_ready;
 
+	wire        pcpi_audio_wr;
+	wire [31:0] pcpi_audio_rd;
+	wire        pcpi_audio_wait;
+	wire        pcpi_audio_ready;
+
 	reg        pcpi_int_wr;
 	reg [31:0] pcpi_int_rd;
 	reg        pcpi_int_wait;
@@ -322,11 +328,31 @@ module picorv32 #(
 		assign pcpi_div_ready = 0;
 	end endgenerate
 
+	generate if (ENABLE_AUDIO) begin
+		picorv32_pcpi_audio pcpi_audio (
+			.clk       (clk            ),
+			.resetn    (resetn         ),
+			.pcpi_valid(pcpi_valid     ),
+			.pcpi_insn (pcpi_insn      ),
+			.pcpi_rs1  (pcpi_rs1       ),
+			.pcpi_rs2  (pcpi_rs2       ),
+			.pcpi_wr   (pcpi_audio_wr  ),
+			.pcpi_rd   (pcpi_audio_rd  ),
+			.pcpi_wait (pcpi_audio_wait),
+			.pcpi_ready(pcpi_audio_ready)
+		);
+	end else begin
+		assign pcpi_audio_wr = 0;
+		assign pcpi_audio_rd = 32'bx;
+		assign pcpi_audio_wait = 0;
+		assign pcpi_audio_ready = 0;
+	end endgenerate
+
 	always @* begin
 		pcpi_int_wr = 0;
 		pcpi_int_rd = 32'bx;
-		pcpi_int_wait  = |{ENABLE_PCPI && pcpi_wait,  (ENABLE_MUL || ENABLE_FAST_MUL) && pcpi_mul_wait,  ENABLE_DIV && pcpi_div_wait};
-		pcpi_int_ready = |{ENABLE_PCPI && pcpi_ready, (ENABLE_MUL || ENABLE_FAST_MUL) && pcpi_mul_ready, ENABLE_DIV && pcpi_div_ready};
+		pcpi_int_wait  = |{ENABLE_PCPI && pcpi_wait,  (ENABLE_MUL || ENABLE_FAST_MUL) && pcpi_mul_wait,  ENABLE_DIV && pcpi_div_wait,  ENABLE_AUDIO && pcpi_audio_wait};
+		pcpi_int_ready = |{ENABLE_PCPI && pcpi_ready, (ENABLE_MUL || ENABLE_FAST_MUL) && pcpi_mul_ready, ENABLE_DIV && pcpi_div_ready, ENABLE_AUDIO && pcpi_audio_ready};
 
 		(* parallel_case *)
 		case (1'b1)
@@ -341,6 +367,10 @@ module picorv32 #(
 			ENABLE_DIV && pcpi_div_ready: begin
 				pcpi_int_wr = pcpi_div_wr;
 				pcpi_int_rd = pcpi_div_rd;
+			end
+			ENABLE_AUDIO && pcpi_audio_ready: begin
+				pcpi_int_wr = pcpi_audio_wr;
+				pcpi_int_rd = pcpi_audio_rd;
 			end
 		endcase
 	end
@@ -2511,6 +2541,311 @@ endmodule
 
 
 /***************************************************************
+ * picorv32_pcpi_audio
+ *
+ * Custom audio-oriented PCPI instructions implemented using the
+ * R-type CUSTOM-0 major opcode (opcode[6:0] = 7'b0001011).
+ *
+	 * funct7 encodings (chosen to avoid clashes with PicoRV32 IRQ
+	 * custom instructions, which occupy funct7 = 0..5):
+	 *   0x20: MAC16   - 2x16-bit signed MAC
+	 *   0x21: MSUB16  - 2x16-bit signed MSUB
+	 *   0x22: ABS16   - lane-wise 16-bit absolute value (saturating)
+	 *   0x23: CONV4   - 4x8-bit dot product
+	 *   0x24: CONV8   - currently same as CONV4
+	 *   0x25: LMSSTEP - currently same as MAC16
+	 *   0x26: CMAC    - complex 16-bit multiply (saturating, packed)
+	 *   0x27: ABS2    - complex magnitude squared (16-bit lanes)
+	 *   0x28: CLIP16  - 16-bit lane-wise symmetric clipping
+	 *   0x29: SHIFTN  - signed fixed-point scaling shift with rounding
+ ***************************************************************/
+
+module picorv32_pcpi_audio (
+	input             clk,
+	input             resetn,
+
+	input             pcpi_valid,
+	input      [31:0] pcpi_insn,
+	input      [31:0] pcpi_rs1,
+	input      [31:0] pcpi_rs2,
+	output            pcpi_wr,
+	output     [31:0] pcpi_rd,
+	output            pcpi_wait,
+	output            pcpi_ready
+);
+	localparam [6:0] OPC_CUSTOM0 = 7'b0001011;
+
+	wire is_custom0 = pcpi_insn[6:0] == OPC_CUSTOM0;
+	wire [6:0] funct7 = pcpi_insn[31:25];
+
+	reg [31:0] result;
+	reg        result_valid;
+
+	// Helper: saturate signed 32-bit to signed 16-bit.
+	function [15:0] sat16_from32;
+		input signed [31:0] x;
+	begin
+		if (x > 32'sd32767)
+			sat16_from32 = 16'sd32767;
+		else if (x < -32'sd32768)
+			sat16_from32 = -16'sd32768;
+		else
+			sat16_from32 = x[15:0];
+	end
+	endfunction
+
+	// 2x16-bit MAC: (a0*b0 + a1*b1)
+	function [31:0] mac16;
+		input [31:0] rs1, rs2;
+		reg  signed [15:0] a0, a1, b0, b1;
+		reg  signed [31:0] p0, p1;
+	begin
+		a0 = rs1[15:0];
+		a1 = rs1[31:16];
+		b0 = rs2[15:0];
+		b1 = rs2[31:16];
+		p0 = a0 * b0;
+		p1 = a1 * b1;
+		mac16 = p0 + p1;
+	end
+	endfunction
+
+	// 2x16-bit MSUB: (a0*b0 - a1*b1)
+	function [31:0] msub16;
+		input [31:0] rs1, rs2;
+		reg  signed [15:0] a0, a1, b0, b1;
+		reg  signed [31:0] p0, p1;
+	begin
+		a0 = rs1[15:0];
+		a1 = rs1[31:16];
+		b0 = rs2[15:0];
+		b1 = rs2[31:16];
+		p0 = a0 * b0;
+		p1 = a1 * b1;
+		msub16 = p0 - p1;
+	end
+	endfunction
+
+	// Lane-wise absolute value on signed 16-bit lanes with saturation.
+	function [31:0] abs16_lanes;
+		input [31:0] x;
+		reg signed [15:0] lo, hi;
+		reg       [15:0] abs_lo, abs_hi;
+	begin
+		lo = x[15:0];
+		hi = x[31:16];
+
+		if (lo[15]) begin
+			if (lo == -16'sd32768)
+				abs_lo = 16'sd32767;
+			else
+				abs_lo = -lo;
+		end else
+			abs_lo = lo;
+
+		if (hi[15]) begin
+			if (hi == -16'sd32768)
+				abs_hi = 16'sd32767;
+			else
+				abs_hi = -hi;
+		end else
+			abs_hi = hi;
+
+		abs16_lanes = {abs_hi, abs_lo};
+	end
+	endfunction
+
+	// 4x8-bit dot product: sum_i rs1[i]*rs2[i] for i=0..3 (signed 8-bit lanes).
+	function [31:0] conv4_8bit;
+		input [31:0] rs1, rs2;
+		reg  signed [7:0] x0, x1, x2, x3;
+		reg  signed [7:0] h0, h1, h2, h3;
+		reg  signed [31:0] acc;
+	begin
+		x0 = rs1[7:0];
+		x1 = rs1[15:8];
+		x2 = rs1[23:16];
+		x3 = rs1[31:24];
+
+		h0 = rs2[7:0];
+		h1 = rs2[15:8];
+		h2 = rs2[23:16];
+		h3 = rs2[31:24];
+
+		acc = x0 * h0;
+		acc = acc + x1 * h1;
+		acc = acc + x2 * h2;
+		acc = acc + x3 * h3;
+
+		conv4_8bit = acc;
+	end
+	endfunction
+
+	// Complex 16-bit multiply with 16-bit saturated outputs.
+	// rs1 = ar + j*ai, rs2 = br + j*bi (ar,ai,br,bi are signed 16-bit).
+	// rd[15:0]  = real part
+	// rd[31:16] = imag part
+	function [31:0] cmac_complex;
+		input [31:0] rs1, rs2;
+		reg  signed [15:0] ar, ai, br, bi;
+		reg  signed [31:0] realp, imagp;
+		reg        [15:0] real16, imag16;
+	begin
+		ar = rs1[15:0];
+		ai = rs1[31:16];
+		br = rs2[15:0];
+		bi = rs2[31:16];
+
+		realp = ar * br - ai * bi;
+		imagp = ar * bi + ai * br;
+
+		real16 = sat16_from32(realp);
+		imag16 = sat16_from32(imagp);
+
+		cmac_complex = {imag16, real16};
+	end
+	endfunction
+
+	// Complex magnitude squared from 16-bit lanes: ar^2 + ai^2.
+	function [31:0] abs2_complex;
+		input [31:0] rs1;
+		reg  signed [15:0] ar, ai;
+		reg  signed [31:0] p0, p1;
+	begin
+		ar = rs1[15:0];
+		ai = rs1[31:16];
+		p0 = ar * ar;
+		p1 = ai * ai;
+		abs2_complex = p0 + p1;
+	end
+	endfunction
+
+	// 16-bit lane-wise symmetric clipping around zero.
+	// rs2[15:0] gives the positive clip limit L (treated as |L|).
+	function [31:0] clip16_lanes;
+		input [31:0] rs1, rs2;
+		reg  signed [15:0] x0, x1;
+		reg  signed [15:0] limit;
+		reg  signed [15:0] y0, y1;
+	begin
+		x0 = rs1[15:0];
+		x1 = rs1[31:16];
+		limit = rs2[15:0];
+		if (limit < 0)
+			limit = -limit;
+
+		y0 = x0;
+		if (x0 > limit)
+			y0 = limit;
+		else if (x0 < -limit)
+			y0 = -limit;
+
+		y1 = x1;
+		if (x1 > limit)
+			y1 = limit;
+		else if (x1 < -limit)
+			y1 = -limit;
+
+		clip16_lanes = {y1, y0};
+	end
+	endfunction
+
+	// Signed fixed-point scaling shift with rounding.
+	// Shift amount = rs2[4:0]. Positive arithmetic right shift with
+	// "round to nearest" semantics.
+	function [31:0] shiftn_round;
+		input [31:0] rs1, rs2;
+		reg  signed [31:0] x;
+		reg  signed [31:0] abs_val;
+		reg  signed [31:0] res;
+		reg  [4:0] shamt;
+		reg  [31:0] bias;
+	begin
+		x = rs1;
+		shamt = rs2[4:0];
+		if (shamt == 0) begin
+			shiftn_round = x;
+		end else begin
+			bias = 32'd1 << (shamt - 1);
+			if (x >= 0) begin
+				res = (x + bias) >>> shamt;
+			end else begin
+				abs_val = -x;
+				res = -((abs_val + bias) >>> shamt);
+			end
+			shiftn_round = res;
+		end
+	end
+	endfunction
+
+		always @* begin
+		result = 0;
+		result_valid = 0;
+
+			if (resetn && pcpi_valid && is_custom0) begin
+				case (funct7)
+					7'b0100000: begin
+						// MAC16
+						result = mac16(pcpi_rs1, pcpi_rs2);
+						result_valid = 1;
+					end
+					7'b0100001: begin
+						// MSUB16
+						result = msub16(pcpi_rs1, pcpi_rs2);
+						result_valid = 1;
+					end
+					7'b0100010: begin
+						// ABS16
+						result = abs16_lanes(pcpi_rs1);
+						result_valid = 1;
+					end
+					7'b0100011: begin
+						// CONV4
+						result = conv4_8bit(pcpi_rs1, pcpi_rs2);
+						result_valid = 1;
+					end
+					7'b0100100: begin
+						// CONV8 (currently same as CONV4)
+						result = conv4_8bit(pcpi_rs1, pcpi_rs2);
+						result_valid = 1;
+					end
+					7'b0100101: begin
+						// LMSSTEP (currently same as MAC16)
+						result = mac16(pcpi_rs1, pcpi_rs2);
+						result_valid = 1;
+					end
+					7'b0100110: begin
+						// CMAC
+						result = cmac_complex(pcpi_rs1, pcpi_rs2);
+						result_valid = 1;
+					end
+					7'b0100111: begin
+						// ABS2
+						result = abs2_complex(pcpi_rs1);
+						result_valid = 1;
+					end
+					7'b0101000: begin
+						// CLIP16
+						result = clip16_lanes(pcpi_rs1, pcpi_rs2);
+						result_valid = 1;
+					end
+					7'b0101001: begin
+						// SHIFTN
+						result = shiftn_round(pcpi_rs1, pcpi_rs2);
+						result_valid = 1;
+				end
+			endcase
+		end
+	end
+
+	assign pcpi_rd    = result;
+	assign pcpi_wr    = result_valid;
+	assign pcpi_wait  = 0;
+	assign pcpi_ready = result_valid;
+endmodule
+
+
+/***************************************************************
  * picorv32_axi
  ***************************************************************/
 
@@ -2530,6 +2865,7 @@ module picorv32_axi #(
 	parameter [ 0:0] ENABLE_MUL = 0,
 	parameter [ 0:0] ENABLE_FAST_MUL = 0,
 	parameter [ 0:0] ENABLE_DIV = 0,
+	parameter [ 0:0] ENABLE_AUDIO = 0,
 	parameter [ 0:0] ENABLE_IRQ = 0,
 	parameter [ 0:0] ENABLE_IRQ_QREGS = 1,
 	parameter [ 0:0] ENABLE_IRQ_TIMER = 1,
@@ -2661,6 +2997,7 @@ module picorv32_axi #(
 		.ENABLE_MUL          (ENABLE_MUL          ),
 		.ENABLE_FAST_MUL     (ENABLE_FAST_MUL     ),
 		.ENABLE_DIV          (ENABLE_DIV          ),
+		.ENABLE_AUDIO        (ENABLE_AUDIO        ),
 		.ENABLE_IRQ          (ENABLE_IRQ          ),
 		.ENABLE_IRQ_QREGS    (ENABLE_IRQ_QREGS    ),
 		.ENABLE_IRQ_TIMER    (ENABLE_IRQ_TIMER    ),
@@ -2828,6 +3165,7 @@ module picorv32_wb #(
 	parameter [ 0:0] ENABLE_MUL = 0,
 	parameter [ 0:0] ENABLE_FAST_MUL = 0,
 	parameter [ 0:0] ENABLE_DIV = 0,
+	parameter [ 0:0] ENABLE_AUDIO = 0,
 	parameter [ 0:0] ENABLE_IRQ = 0,
 	parameter [ 0:0] ENABLE_IRQ_QREGS = 1,
 	parameter [ 0:0] ENABLE_IRQ_TIMER = 1,
@@ -2925,6 +3263,7 @@ module picorv32_wb #(
 		.ENABLE_MUL          (ENABLE_MUL          ),
 		.ENABLE_FAST_MUL     (ENABLE_FAST_MUL     ),
 		.ENABLE_DIV          (ENABLE_DIV          ),
+		.ENABLE_AUDIO        (ENABLE_AUDIO        ),
 		.ENABLE_IRQ          (ENABLE_IRQ          ),
 		.ENABLE_IRQ_QREGS    (ENABLE_IRQ_QREGS    ),
 		.ENABLE_IRQ_TIMER    (ENABLE_IRQ_TIMER    ),
