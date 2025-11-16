@@ -240,34 +240,43 @@ static void nl(void) { putch('\n'); }
  * ------------------------------------------------------------------*/
 int main(void)
 {
-    /* Inputs packed as low=left, high=right (signed 16-bit each) */
-    uint32_t stereo_a = (uint32_t)(int16_t)1000 | ((uint32_t)(int16_t)-2000 << 16);
-    uint32_t stereo_b = (uint32_t)(int16_t)3000 | ((uint32_t)(int16_t)4000 << 16);
+    uint32_t a = (uint16_t)1000 | ((uint32_t)(int16_t)-2000 << 16);
+    uint32_t b = (uint16_t)3000 | ((uint32_t)(int16_t)4000 << 16);
 
-    /* call custom instructions */
-    uint32_t mac    = aux_mac16(stereo_a, stereo_b);
-    uint32_t mag2   = aux_abs2(stereo_a);
-    uint32_t scaled = aux_shiftn(mac, 4);
+    puts("Hi\n");
 
-    /* human-friendly output */
-    puts("Hi");
-    nl();
+    uint32_t mac    = aux_mac16(a, b);
+    uint32_t msub   = aux_msub16(a, b);
+    uint32_t abs16  = aux_abs16(a);
+    uint32_t conv4  = aux_conv4(a, b);
+    uint32_t conv8  = aux_conv8(a, b);
+    uint32_t lms    = aux_lmsstep(a, b);
+    uint32_t cmac   = aux_cmac(a, b);
+    uint32_t abs2   = aux_abs2(a);
+    uint32_t clip   = aux_clip16(a, 1200);
+    uint32_t shift  = aux_shiftn(mac, 4);
 
-    puts("mac    = "); print_hex32(mac); nl();
-    puts("mag2   = "); print_uint(mag2); nl();
-    puts("scaled = "); print_hex32(scaled); nl();
+    /* Print results */
+    puts("mac16   = "); print_hex32(mac); nl();
+    puts("msub16  = "); print_hex32(msub); nl();
+    puts("abs16   = "); print_hex32(abs16); nl();
+    puts("conv4   = "); print_hex32(conv4); nl();
+    puts("conv8   = "); print_hex32(conv8); nl();
+    puts("lms     = "); print_hex32(lms); nl();
+    puts("cmac    = "); print_hex32(cmac); nl();
+    puts("abs2    = "); print_uint(abs2); nl();
+    puts("clip16  = "); print_hex32(clip); nl();
+    puts("shiftn  = "); print_hex32(shift); nl();
 
-    /* raw bytes (as before) to help low-level checks */
     puts("raw16: ");
     print_raw16(mac);
-    print_raw16(mag2);
-    print_raw16(scaled);
+    print_raw16(abs2);
+    print_raw16(shift);
     nl();
 
-    /* signal success and stop */
     *PASS = 123456789;
     __asm__ volatile("ebreak");
-    while (1) { /* never reached */ }
 
+    while (1);
     return 0;
 }
