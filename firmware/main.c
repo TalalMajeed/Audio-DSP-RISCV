@@ -135,6 +135,17 @@ static void noise_clean_samples(int16_t *samples, uint32_t num_samples)
         if (env_avg < 0)
             env_avg = 0;
 
+        /* Early-out gate: treat very low-level regions as silence. */
+        if (env_avg == 0) {
+            samples[i] = 0;
+            prev_x = x_clipped;
+            prev_diff = 0;
+            prev2_diff = 0;
+            lms_c0 = 0;
+            lms_c1 = 0;
+            continue;
+        }
+
         /* 5) Simple 2-tap high-pass: y = x - prev_x (MAC16). */
         uint32_t hp_x_pack = pack16(x_clipped, prev_x);
         uint32_t hp_h_pack = pack16(1, -1);
