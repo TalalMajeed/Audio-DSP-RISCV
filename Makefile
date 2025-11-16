@@ -20,7 +20,8 @@ VVP = vvp$(ICARUS_SUFFIX)
 # Compile only your firmware sources:
 #   firmware/crt0.S
 #   firmware/main.c
-FIRMWARE_OBJS = firmware/crt0.o firmware/main.o
+#   firmware/aux.c
+FIRMWARE_OBJS = firmware/crt0.o firmware/aux.o firmware/main.o
 
 # Keep the test objects — required for testbench operations
 TEST_OBJS =

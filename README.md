@@ -117,9 +117,9 @@ the AUX instructions use funct7 values starting at 0x20:
 
 ## C wrappers
 
-All C wrappers live in `firmware/main.c:13-188`. They encode the AUX instructions as raw `.word` values using fixed registers:
+All C wrappers live in `firmware/aux.h` and `firmware/aux.c`. They encode the AUX instructions as raw `.word` values using fixed registers:
 
-- Wrapper convention:
+- Wrapper convention (implemented in `aux.c`):
   - `a0` (x10) – used as both `rs1` and `rd` inside the instruction.
   - `a1` (x11) – used as `rs2` for two‑operand ops.
   - Wrappers move their arguments into `a0`/`a1`, emit the encoded instruction word, then move `a0` back into a C variable.
