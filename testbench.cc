@@ -199,6 +199,13 @@ int main(int argc, char **argv, char **env)
 		trace_fd = fopen("testbench.trace", "w");
 	}
 
+	// Optional register logging for progress (+reglog)
+	bool reglog = false;
+	const char* flag_reglog = Verilated::commandArgsPlusMatch("reglog");
+	if (flag_reglog && 0==strcmp(flag_reglog, "+reglog")) {
+		reglog = true;
+	}
+
 	top->clk = 0;
 	top->resetn = 0;
 
@@ -214,6 +221,7 @@ int main(int argc, char **argv, char **env)
 	}
 
 	int t = 0;
+	uint64_t cycle_count = 0;
 	while (!Verilated::gotFinish()) {
 		if (t > 200)
 			top->resetn = 1;
@@ -221,6 +229,20 @@ int main(int argc, char **argv, char **env)
 		top->eval();
 		if (tfp) tfp->dump (t);
 		if (trace_fd && top->clk && top->trace_valid) std::fprintf(trace_fd, "%9.9llx\n", (unsigned long long)top->trace_data);
+
+		if (top->clk && top->resetn) {
+			cycle_count++;
+			if (reglog && (cycle_count % 10000ull) == 0ull) {
+				Vpicorv32_wrapper_picorv32_wrapper *core = top->picorv32_wrapper;
+				uint32_t pc = core->__PVT__uut__DOT__picorv32_core__DOT__reg_pc;
+				uint32_t x1 = core->__PVT__uut__DOT__picorv32_core__DOT__cpuregs[1];
+				uint32_t x10 = core->__PVT__uut__DOT__picorv32_core__DOT__cpuregs[10];
+				uint32_t x11 = core->__PVT__uut__DOT__picorv32_core__DOT__cpuregs[11];
+				std::printf("REGLOG cycle=%llu pc=0x%08x x1=0x%08x x10=0x%08x x11=0x%08x\n",
+				            (unsigned long long)cycle_count, pc, x1, x10, x11);
+			}
+		}
+
 		t += 5;
 	}
 

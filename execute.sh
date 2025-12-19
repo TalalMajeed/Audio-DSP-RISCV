@@ -72,4 +72,4 @@ echo " Running Verilator Testbench "
 echo "=========================================="
 echo ""
 
-./testbench_verilator +noerror +inwav="$IN_WAV" +outwav="$OUT_WAV" +wavbase=0x"$WAV_BASE_HEX"
+./testbench_verilator +noerror +reglog +inwav="$IN_WAV" +outwav="$OUT_WAV" +wavbase=0x"$WAV_BASE_HEX"
